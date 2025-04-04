@@ -2,67 +2,102 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import os
-from urllib.parse import urlparse
+import logging
+
+# Logging yapılandırması
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+# Tüm domainlerden erişime izin veriyoruz, daha sonra sınırlandırabilirsiniz
+CORS(app, origins=["*"])
 
-# CORS ayarı
-CORS(app, origins=["https://www.batuhandurmaz.com"], methods=["POST", "OPTIONS"], allow_headers=["Content-Type"])
-
-# Google API bilgileri
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
-
-# Arama fonksiyonu
-def search_internal_links(keyword, target_page, num_results=10):
-    parsed_url = urlparse(target_page)
-    domain = parsed_url.netloc
-
-    # Ana sayfa direkt girilmişse reddet
-    if parsed_url.path == "/" or parsed_url.path.strip() == "":
-        raise ValueError("Lütfen tam bir sayfa URL'si girin (örneğin: https://site.com/blog/yazi)")
-
-    query = f'site:{domain} "{keyword}" -inurl:{target_page}'
-
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {
-        'q': query,
-        'key': GOOGLE_API_KEY,
-        'cx': GOOGLE_CSE_ID,
-        'num': num_results
-    }
-
-    response = requests.get(url, params=params)
-    data = response.json()
-
-    # 🔐 Sadece aynı domain'e ait sonuçları filtrele
-    results = []
-    for item in data.get("items", []):
-        link_domain = urlparse(item["link"]).netloc
-        if link_domain == domain:
-            results.append(item["link"])
-
-    return results
-
-# API endpoint
-@app.route("/api/search", methods=["POST"])
-def handle_search():
-    data = request.json
-    keyword = data.get("keyword")
-    target_page = data.get("url")
-
-    if not keyword or not target_page:
-        return jsonify({"error": "Anahtar kelime ve hedef URL gereklidir."}), 400
-
+def check_url(url):
     try:
-        results = search_internal_links(keyword, target_page)
-        return jsonify({"results": results})
-    except ValueError as ve:
-        return jsonify({"error": str(ve)}), 400
+        # Zaman aşımını arttıralım
+        response = requests.get(url, allow_redirects=False, timeout=15)
+        if response.status_code == 301:
+            return {
+                "url": url,
+                "redirect_to": response.headers.get('Location', url),
+                "status": 301,
+                "note": "Çözüm İçin Danış"
+            }
+        elif response.status_code in range(300, 399):
+            return {
+                "url": url,
+                "redirect_to": response.headers.get('Location', url),
+                "status": response.status_code,
+                "note": "Yönlendirme"
+            }
+        else:
+            return {
+                "url": url,
+                "redirect_to": url,
+                "status": response.status_code,
+                "note": "" if response.status_code == 200 else "Çözüm İçin Danış"
+            }
+    except requests.exceptions.Timeout:
+        logger.warning(f"Timeout while checking URL: {url}")
+        return {
+            "url": url,
+            "redirect_to": url,
+            "status": "Zaman Aşımı",
+            "note": "Çözüm İçin Danış"
+        }
+    except requests.exceptions.ConnectionError:
+        logger.warning(f"Connection error while checking URL: {url}")
+        return {
+            "url": url,
+            "redirect_to": url,
+            "status": "Bağlantı Hatası",
+            "note": "Çözüm İçin Danış"
+        }
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Request exception for URL {url}: {str(e)}")
+        return {
+            "url": url,
+            "redirect_to": url,
+            "status": "Erişilemedi",
+            "note": "Çözüm İçin Danış"
+        }
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Unexpected error for URL {url}: {str(e)}")
+        return {
+            "url": url,
+            "redirect_to": url,
+            "status": "Hata",
+            "note": "Çözüm İçin Danış"
+        }
 
-# Railway port ayarı
+@app.route("/api/check-urls", methods=["POST"])
+def check_urls():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "JSON verisi gerekli"}), 400
+            
+        urls = data.get("urls", [])
+        if not urls:
+            return jsonify({"error": "En az bir URL gerekli"}), 400
+            
+        results = [check_url(url) for url in urls[:100]]
+        return jsonify(results)
+    except Exception as e:
+        logger.error(f"Error in check_urls endpoint: {str(e)}")
+        return jsonify({"error": "İstek işlenirken bir hata oluştu"}), 500
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "status": "active",
+        "service": "HTTP Status Checker API",
+        "endpoints": {
+            "/api/check-urls": "POST - URL durumlarını kontrol etmek için"
+        },
+        "usage": "POST isteği ile JSON formatında 'urls' listesi gönderin"
+    })
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port) 
